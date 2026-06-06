@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -20,6 +21,8 @@ DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_RECENT_LIMIT = 5
 DEFAULT_CITED_LIMIT = 5
 USER_AGENT = "OpenClaw ORCID workflow/1.0"
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_BACKOFF_SECONDS = 1.0
 
 
 class WorkflowError(RuntimeError):
@@ -31,6 +34,15 @@ class AuthorRecord:
     openalex_id: str
     display_name: str
     orcid: str
+
+
+@dataclass
+class RequestOptions:
+    headers: dict[str, str]
+    openalex_mailto: str | None = None
+    openalex_api_key: str | None = None
+    max_retries: int = DEFAULT_MAX_RETRIES
+    backoff_seconds: float = DEFAULT_BACKOFF_SECONDS
 
 
 def normalize_orcid(orcid: str) -> str:
@@ -57,26 +69,62 @@ def build_headers(mailto: str | None) -> dict[str, str]:
     return headers
 
 
-def fetch_json(url: str, *, headers: dict[str, str]) -> dict[str, Any]:
-    req = request.Request(url, headers=headers)
-    try:
-        with request.urlopen(req, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-            return json.load(response)
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise WorkflowError(f"HTTP {exc.code} for {url}: {detail}") from exc
-    except error.URLError as exc:
-        raise WorkflowError(f"Network error for {url}: {exc.reason}") from exc
+def build_openalex_url(
+    path: str, params: dict[str, Any], *, mailto: str | None, api_key: str | None
+) -> str:
+    enriched = {key: value for key, value in params.items() if value is not None}
+    if mailto:
+        enriched["mailto"] = mailto
+    if api_key:
+        enriched["api_key"] = api_key
+    return f"{OPENALEX_API}{path}?{parse.urlencode(enriched)}"
 
 
-def find_author(orcid: str, *, headers: dict[str, str]) -> AuthorRecord:
-    query = parse.urlencode(
+def retry_delay(exc: error.HTTPError, attempt: int, base_delay: float) -> float:
+    retry_after = exc.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.0)
+        except ValueError:
+            pass
+    return base_delay * (2 ** (attempt - 1))
+
+
+def fetch_json(url: str, *, options: RequestOptions) -> dict[str, Any]:
+    req = request.Request(url, headers=options.headers)
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            with request.urlopen(req, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+                return json.load(response)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            is_retryable = exc.code == 429 or 500 <= exc.code < 600
+            if is_retryable and attempt <= options.max_retries:
+                time.sleep(retry_delay(exc, attempt, options.backoff_seconds))
+                continue
+            raise WorkflowError(f"HTTP {exc.code} for {url}: {detail}") from exc
+        except error.URLError as exc:
+            if attempt <= options.max_retries:
+                time.sleep(options.backoff_seconds * (2 ** (attempt - 1)))
+                continue
+            raise WorkflowError(f"Network error for {url}: {exc.reason}") from exc
+
+
+def find_author(orcid: str, *, options: RequestOptions) -> AuthorRecord:
+    url = build_openalex_url(
+        "/authors",
         {
             "filter": f"orcid:https://orcid.org/{orcid}",
             "per-page": 1,
-        }
+            "select": "id,display_name",
+        },
+        mailto=options.openalex_mailto,
+        api_key=options.openalex_api_key,
     )
-    payload = fetch_json(f"{OPENALEX_API}/authors?{query}", headers=headers)
+    payload = fetch_json(url, options=options)
     results = payload.get("results", [])
     if not results:
         raise WorkflowError(f"No OpenAlex author record found for ORCID {orcid}")
@@ -89,8 +137,8 @@ def find_author(orcid: str, *, headers: dict[str, str]) -> AuthorRecord:
     )
 
 
-def fetch_orcid_record(orcid: str, *, headers: dict[str, str]) -> dict[str, Any]:
-    return fetch_json(f"{ORCID_PUBLIC_API}/{orcid}/record", headers=headers)
+def fetch_orcid_record(orcid: str, *, options: RequestOptions) -> dict[str, Any]:
+    return fetch_json(f"{ORCID_PUBLIC_API}/{orcid}/record", options=options)
 
 
 def fetch_works(
@@ -98,16 +146,23 @@ def fetch_works(
     *,
     sort: str,
     limit: int,
-    headers: dict[str, str],
+    options: RequestOptions,
 ) -> list[dict[str, Any]]:
-    query = parse.urlencode(
+    url = build_openalex_url(
+        "/works",
         {
             "filter": f"author.id:{author.openalex_id}",
             "sort": sort,
             "per-page": limit,
-        }
+            "select": (
+                "id,title,publication_year,publication_date,cited_by_count,doi,"
+                "best_oa_location,primary_location,open_access,locations"
+            ),
+        },
+        mailto=options.openalex_mailto,
+        api_key=options.openalex_api_key,
     )
-    payload = fetch_json(f"{OPENALEX_API}/works?{query}", headers=headers)
+    payload = fetch_json(url, options=options)
     return list(payload.get("results", []))
 
 
@@ -225,6 +280,7 @@ def summarize_orcid_profile(record: dict[str, Any]) -> dict[str, Any]:
     person = record.get("person") or {}
     activities = record.get("activities-summary") or {}
     name = person.get("name") or {}
+    biography = person.get("biography") or {}
 
     employments = [
         normalize_affiliation(item, "employment")
@@ -287,7 +343,7 @@ def summarize_orcid_profile(record: dict[str, Any]) -> dict[str, Any]:
         )
         or None,
         "credit_name": extract_value(name.get("credit-name")),
-        "biography": extract_value(person.get("biography", {}).get("content")),
+        "biography": extract_value(biography.get("content")),
         "locale": extract_value((record.get("preferences") or {}).get("locale")),
         "other_names": compact(
             [
@@ -357,8 +413,8 @@ def build_filename(work: dict[str, Any]) -> str:
     return f"{publication_year(work)}-{slugify(title)[:80]}-{work_id}.pdf"
 
 
-def download_pdf(url: str, destination: Path, *, headers: dict[str, str]) -> None:
-    req = request.Request(url, headers=headers)
+def download_pdf(url: str, destination: Path, *, options: RequestOptions) -> None:
+    req = request.Request(url, headers=options.headers)
     try:
         with request.urlopen(req, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
             content_type = response.headers.get("Content-Type", "")
@@ -410,7 +466,7 @@ def process_downloads(
     works: list[dict[str, Any]],
     output_dir: Path,
     *,
-    headers: dict[str, str],
+    options: RequestOptions,
     pause_seconds: float,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
@@ -428,7 +484,7 @@ def process_downloads(
         item["output_file"] = str(destination)
 
         try:
-            download_pdf(pdf_url, destination, headers=headers)
+            download_pdf(pdf_url, destination, options=options)
             item["download_status"] = "downloaded"
         except WorkflowError as exc:
             item["download_status"] = "failed"
@@ -504,12 +560,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=0.5,
         help="Delay between PDF downloads in seconds (default: 0.5)",
     )
+    parser.add_argument(
+        "--openalex-mailto",
+        help=(
+            "Email to include as the OpenAlex mailto query parameter. "
+            "Defaults to --mailto if not set."
+        ),
+    )
+    parser.add_argument(
+        "--openalex-api-key",
+        help=(
+            "OpenAlex API key. Defaults to the OPENALEX_API_KEY environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=f"Maximum retries for retryable API errors like 429 (default: {DEFAULT_MAX_RETRIES})",
+    )
+    parser.add_argument(
+        "--backoff-seconds",
+        type=float,
+        default=DEFAULT_BACKOFF_SECONDS,
+        help=f"Initial backoff for retries in seconds (default: {DEFAULT_BACKOFF_SECONDS})",
+    )
     return parser.parse_args(argv)
 
 
 def validate_positive(value: int, name: str) -> None:
     if value <= 0:
         raise WorkflowError(f"{name} must be greater than zero")
+
+
+def validate_non_negative(value: float, name: str) -> None:
+    if value < 0:
+        raise WorkflowError(f"{name} must not be negative")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -519,23 +605,40 @@ def main(argv: list[str] | None = None) -> int:
         orcid = normalize_orcid(args.orcid)
         validate_positive(args.recent_limit, "recent-limit")
         validate_positive(args.cited_limit, "cited-limit")
+        validate_positive(args.max_retries, "max-retries")
+        validate_non_negative(args.backoff_seconds, "backoff-seconds")
 
         headers = build_headers(args.mailto)
-        orcid_record = fetch_orcid_record(orcid, headers=headers)
+        openalex_mailto = args.openalex_mailto or args.mailto
+        openalex_api_key = args.openalex_api_key or os.environ.get("OPENALEX_API_KEY")
+        if not openalex_api_key:
+            raise WorkflowError(
+                "OpenAlex API key required. Set OPENALEX_API_KEY or pass --openalex-api-key."
+            )
+
+        options = RequestOptions(
+            headers=headers,
+            openalex_mailto=openalex_mailto,
+            openalex_api_key=openalex_api_key,
+            max_retries=args.max_retries,
+            backoff_seconds=args.backoff_seconds,
+        )
+
+        orcid_record = fetch_orcid_record(orcid, options=options)
         orcid_profile = summarize_orcid_profile(orcid_record)
-        author = find_author(orcid, headers=headers)
+        author = find_author(orcid, options=options)
         identity_check = build_identity_check(author, orcid_profile)
         recent_raw = fetch_works(
             author,
             sort="publication_date:desc",
             limit=args.recent_limit,
-            headers=headers,
+            options=options,
         )
         cited_raw = fetch_works(
             author,
             sort="cited_by_count:desc",
             limit=args.cited_limit,
-            headers=headers,
+            options=options,
         )
 
         recent = [summarize_work(work) for work in recent_raw]
@@ -545,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         combined = process_downloads(
             combined,
             output_dir,
-            headers=headers,
+            options=options,
             pause_seconds=args.pause_seconds,
         )
         manifest_path = write_manifest(

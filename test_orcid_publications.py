@@ -1,4 +1,5 @@
 import unittest
+from urllib import error
 
 import orcid_publications as op
 
@@ -145,6 +146,45 @@ class OrcidPublicationsTests(unittest.TestCase):
         check = op.build_identity_check(author, {"display_name": "Ada Lovelace"})
         self.assertFalse(check["names_match"])
         self.assertIn("does not match", check["warning"])
+
+    def test_summarize_orcid_profile_handles_null_biography(self) -> None:
+        profile = op.summarize_orcid_profile(
+            {
+                "person": {
+                    "name": {
+                        "given-names": {"value": "Test"},
+                        "family-name": {"value": "User"},
+                    },
+                    "biography": None,
+                },
+                "activities-summary": {},
+            }
+        )
+        self.assertIsNone(profile["biography"])
+
+    def test_build_openalex_url_includes_mailto_and_api_key(self) -> None:
+        url = op.build_openalex_url(
+            "/works",
+            {"filter": "author.id:A1", "per-page": 5},
+            mailto="me@example.com",
+            api_key="secret",
+        )
+        self.assertIn("mailto=me%40example.com", url)
+        self.assertIn("api_key=secret", url)
+        self.assertIn("per-page=5", url)
+
+    def test_retry_delay_prefers_retry_after_header(self) -> None:
+        exc = error.HTTPError(
+            url="https://api.openalex.org/works",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={"Retry-After": "3"},
+            fp=None,
+        )
+        try:
+            self.assertEqual(op.retry_delay(exc, attempt=2, base_delay=1.0), 3.0)
+        finally:
+            exc.close()
 
 
 if __name__ == "__main__":

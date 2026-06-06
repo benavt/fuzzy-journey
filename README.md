@@ -8,7 +8,8 @@ metadata when available.
 ## Usage
 
 ```bash
-python3 orcid_publications.py 0000-0002-1825-0097 --output-dir output
+OPENALEX_API_KEY=your_key_here \
+python3 orcid_publications.py 0000-0002-1825-0097 --output-dir output --mailto you@example.com
 ```
 
 Optional flags:
@@ -16,6 +17,10 @@ Optional flags:
 - `--recent-limit 10` to inspect more recent works
 - `--cited-limit 10` to inspect more highly cited works
 - `--mailto you@example.com` to include a contact email in API requests
+- `--openalex-mailto you@example.com` to explicitly set OpenAlex's `mailto` query parameter
+- `--openalex-api-key your_key_here` instead of using the `OPENALEX_API_KEY` environment variable
+- `--max-retries 5` to retry `429` and server errors with exponential backoff
+- `--backoff-seconds 1.0` to control the initial retry wait
 - `--pause-seconds 1.0` to slow down download requests
 
 The workflow writes:
@@ -42,6 +47,9 @@ or race/ethnicity, so those are left unavailable in the manifest.
 ## Notes
 
 - Metadata comes from the OpenAlex API and the ORCID public API.
+- OpenAlex now requires an API key for normal usage as of February 13, 2026.
+- The workflow identifies itself politely to OpenAlex via the `mailto` query parameter
+  and retries `429`/5xx responses with exponential backoff.
 - PDF downloads only succeed when OpenAlex exposes a direct PDF URL or an open
   access PDF link that resolves to a PDF.
 - Job title, degrees, universities attended, and domain expertise are
