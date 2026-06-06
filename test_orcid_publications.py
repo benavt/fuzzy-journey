@@ -186,6 +186,22 @@ class OrcidPublicationsTests(unittest.TestCase):
         finally:
             exc.close()
 
+    def test_reconstruct_abstract_sorts_positions(self) -> None:
+        abstract = op.reconstruct_abstract({"world": [1], "hello": [0]})
+        self.assertEqual(abstract, "hello world")
+
+    def test_extract_pdf_strings_handles_literals_and_hex(self) -> None:
+        content = b"BT (Hello\\040world) Tj <4869> Tj ET"
+        self.assertEqual(op.extract_pdf_strings(content), ["Hello world", "Hi"])
+
+    def test_decode_pdf_literal_handles_large_octal_escape(self) -> None:
+        decoded = op.decode_pdf_literal(b"\\777")
+        self.assertIsInstance(decoded, str)
+
+    def test_normalize_extracted_text_collapses_whitespace(self) -> None:
+        text = op.normalize_extracted_text("Hello   world\n\n\nNext")
+        self.assertEqual(text, "Hello world\n\nNext")
+
 
 if __name__ == "__main__":
     unittest.main()
